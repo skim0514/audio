@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch import nn
 from torch.nn import functional as F
+import torchaudio
 
 
 class _ScaledEmbedding(torch.nn.Module):
@@ -474,8 +475,17 @@ class HDemucs(torch.nn.Module):
         le = int(math.ceil(x.shape[-1] / hl))
         pad = hl // 2 * 3
         x = F.pad(x, [pad, pad + le * hl - x.shape[-1]], mode="reflect")
-
-        z = _spectro(x, nfft, hl)[..., :-1, :]
+        z = torchaudio.functional.spectrogram(
+            x,
+            n_fft=nfft,
+            pad=0,
+            hop_length=hl,
+            window=torch.hann_window(nfft).to(x),
+            win_length=nfft,
+            power=None,
+            normalized=True,
+            return_complex=True,
+        )[..., :-1, :]
         assert z.shape[-1] == le + 4, "spectrogram's last dimension must be 4 + input size divided by stride"
         z = z[..., 2 : 2 + le]
         return z
@@ -486,7 +496,19 @@ class HDemucs(torch.nn.Module):
         z = F.pad(z, [2, 2])
         pad = hl // 2 * 3
         le = hl * int(math.ceil(length / hl)) + 2 * pad
-        x = _ispectro(z, hl, length=le)
+
+        freqs = int(z.shape[-2])
+        n_fft = 2 * freqs - 2
+        x = torchaudio.functional.inverse_spectrogram(
+            spectrogram=z,
+            length=le,
+            hop_length=hl,
+            n_fft=n_fft,
+            win_length=n_fft,
+            window=torch.hann_window(n_fft).to(z.real),
+            normalized=True,
+            pad=0
+        )
         x = x[..., pad : pad + length]
         return x
 
@@ -886,46 +908,3 @@ def _rescale_module(module):
             sub.weight.data /= scale
             if sub.bias is not None:
                 sub.bias.data /= scale
-
-
-def _spectro(x: torch.Tensor, n_fft: int = 512, hop_length: int = 0, pad: int = 0) -> torch.Tensor:
-    other = list(x.shape[:-1])
-    length = int(x.shape[-1])
-    x = x.reshape(-1, length)
-    z = torch.stft(
-        x,
-        n_fft * (1 + pad),
-        hop_length,
-        window=torch.hann_window(n_fft).to(x),
-        win_length=n_fft,
-        normalized=True,
-        center=True,
-        return_complex=True,
-        pad_mode="reflect",
-    )
-    _, freqs, frame = z.shape
-    other.extend([freqs, frame])
-    return z.view(other)
-
-
-def _ispectro(z: torch.Tensor, hop_length: int = 0, length: int = 0, pad: int = 0) -> torch.Tensor:
-    other = list(z.shape[:-2])
-    freqs = int(z.shape[-2])
-    frames = int(z.shape[-1])
-
-    n_fft = 2 * freqs - 2
-    z = z.view(-1, freqs, frames)
-    win_length = n_fft // (1 + pad)
-    x = torch.istft(
-        z,
-        n_fft,
-        hop_length,
-        window=torch.hann_window(win_length).to(z.real),
-        win_length=win_length,
-        normalized=True,
-        length=length,
-        center=True,
-    )
-    _, length = x.shape
-    other.append(length)
-    return x.view(other)
